@@ -382,6 +382,7 @@ func (c *client) onReply(from uint64, r node.Response) {
 		c.w.ops = append(c.w.ops, porcupine.Operation{
 			ClientId: c.idx, Input: c.cur.in, Call: int64(c.cur.call),
 			Output: check.Output{Value: r.Value}, Return: int64(c.w.now),
+			Metadata: from, // which node answered
 		})
 		if c.cur.in.Kind != kv.Get {
 			c.leader = from

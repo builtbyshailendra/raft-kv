@@ -30,6 +30,41 @@ type Options struct {
 	// instead of needing a whole snapshot. 0 disables snapshots.
 	SnapshotEvery uint64
 	KeepEntries   uint64
+
+	// Read selects how Gets are served. Only ReadIndex is correct under
+	// every fault the simulator injects.
+	Read ReadMode
+	// Bugs plants known mistakes so tests can show the checkers catch them.
+	Bugs Bugs
+}
+
+// ReadMode is how a node answers a Get.
+type ReadMode int
+
+const (
+	// ReadIndex confirms leadership with a quorum before every read
+	// (raft's ReadOnlySafe). Correct.
+	ReadIndex ReadMode = iota
+	// ReadLease trusts the leader's lease instead of asking a quorum
+	// (raft's ReadOnlyLeaseBased). Faster, but only correct while clocks
+	// run at about the same speed and processes don't stall.
+	ReadLease
+	// ReadLeaderLocal: the leader answers from its own state with no
+	// check that it is still leader. A bug.
+	ReadLeaderLocal
+	// ReadAnyLocal: any node answers from its own state. A bug.
+	ReadAnyLocal
+)
+
+func (m ReadMode) String() string {
+	return [...]string{"ReadIndex", "lease", "leader-local", "any-local"}[m]
+}
+
+// Bugs are deliberate mistakes.
+type Bugs struct {
+	AckBeforeCommit       bool // answer a write as soon as it is proposed
+	NoSessions            bool // no session table: a retried write applies again
+	SessionsNotInSnapshot bool // snapshots leave out the session table
 }
 
 func (o Options) withDefaults() Options {
@@ -140,7 +175,11 @@ func Start(id, incarnation uint64, disk *raft.MemoryStorage, env Env, opts Optio
 	if err != nil {
 		return nil, err
 	}
-	store := kv.New(true)
+	store := kv.New(!opts.Bugs.NoSessions)
+	readOpt := raft.ReadOnlySafe
+	if opts.Read == ReadLease {
+		readOpt = raft.ReadOnlyLeaseBased // requires CheckQuorum, which is on
+	}
 	if err := store.Restore(snap.GetData(), snap.GetMetadata().GetIndex()); err != nil {
 		return nil, err
 	}
@@ -159,6 +198,7 @@ func Start(id, incarnation uint64, disk *raft.MemoryStorage, env Env, opts Optio
 		PreVote:     true,
 		// Clients must send writes to the leader; followers say who it is.
 		DisableProposalForwarding: true,
+		ReadOnlyOption:            readOpt,
 		Logger:                    quiet{},
 	})
 	if err != nil {
@@ -258,7 +298,11 @@ func (n *Node) Handle(c kv.Command) {
 	}
 	// Answer only once the entry is committed and applied. Answering now
 	// would acknowledge a write that a new leader may later overwrite.
-	n.writes[writeKey{c.Client, c.Seq}] = c
+	if n.opts.Bugs.AckBeforeCommit {
+		n.reply(c, Response{OK: true})
+	} else {
+		n.writes[writeKey{c.Client, c.Seq}] = c
+	}
 	n.process()
 }
 
@@ -268,6 +312,18 @@ func (n *Node) Handle(c kv.Command) {
 // answering. The read is then served once this node has applied up to that
 // index, so it reflects every write acknowledged before the read began.
 func (n *Node) read(c kv.Command) {
+	switch n.opts.Read {
+	case ReadAnyLocal:
+		n.reply(c, Response{OK: true, Value: n.store.Get(c.Key)})
+		return
+	case ReadLeaderLocal:
+		if n.state == raft.StateLeader {
+			n.reply(c, Response{OK: true, Value: n.store.Get(c.Key)})
+		} else {
+			n.reply(c, Response{Err: ErrNotLeader, Leader: n.lead})
+		}
+		return
+	}
 	if n.lead == raft.None {
 		n.reply(c, Response{Err: ErrNotLeader})
 		return
@@ -379,7 +435,7 @@ func (n *Node) maybeSnapshot() {
 	if every == 0 || applied-n.snapIndex < every {
 		return
 	}
-	data := n.store.Snapshot(true)
+	data := n.store.Snapshot(!n.opts.Bugs.SessionsNotInSnapshot)
 	if _, err := n.disk.CreateSnapshot(applied, n.conf, data); err != nil {
 		panic(fmt.Sprintf("node %d: snapshot at %d: %v", n.id, applied, err))
 	}

@@ -35,7 +35,9 @@ Tests:
 - **20% loss and 10% duplication:** 50 appends retried until acknowledged; the result has each value exactly once, thanks to the session table.
 - **A paused leader wakes up believing it leads.** During a 2-second pause the others elect a new leader and commit `x=new`; the paused node still thinks it leads and still has `x=old`. Only processing the new term's heartbeats from its inbox corrects it.
 
-What I learned here: with CheckQuorum on and equal clocks, the isolated leader stepped down (93 ms after the cut) before the majority elected a new one (111 ms). So a leader answering reads from its own memory would rarely be caught by partitions alone. A pause is what opens the window: the paused node doesn't tick, so it can't notice anything. That's why the pause fault exists.
+What I thought I learned here: with CheckQuorum on and equal clocks, the isolated leader stepped down (93 ms after the cut) before the majority elected a new one (111 ms), so only a pause could open a window where two nodes believe they lead. That's why the pause fault exists.
+
+**Correction (step 5):** that was one seed. Measured over 500 seeds, a new leader is elected before the old one steps down in 260 of them (52%), by up to 89 ms. See step 5.
 
 ### Step 3: clients, linearizable reads, Porcupine
 
@@ -75,3 +77,63 @@ Tests:
 - 500 seeds with every fault on and aggressive snapshots (every 20 entries, keep 5): 188,419 operations, all linearizable. Leaders sent 749 snapshots and followers installed 715; the other 34 were lost in transit, reported as failed, and resent.
 
 **What broke:** the first snapshot test failed with "node 2 state differs". The bug was in my test helper, not the store: it used 0 to mean "no applied index seen yet", so a node that had just restarted (applied index 0) was skipped and the helper declared convergence too early. Fixed to compare all running nodes; every earlier test that uses it was rerun and still passes.
+
+### Step 5: plant bugs and make sure they're caught
+
+A checker that never fails proves nothing. `TestPlantedBugsAreCaught` turns on one known mistake at a time and runs 200 seeds against it (runs are deterministic, so these counts are stable):
+
+| Planted bug | Expected | Seeds failing | Not linearizable | Safety check | Liveness |
+|---|---|---|---|---|---|
+| control: ReadIndex, no bugs, all faults | must pass | 0 / 200 | 0 | 0 | 0 |
+| control: same, snapshots every 20 entries | must pass | 0 / 200 | 0 | 0 | 0 |
+| control: same, clients time out after 50 ms | must pass | 0 / 200 | 0 | 0 | 0 |
+| answer a write before it commits | must be caught | 138 / 200 | 138 | 0 | 0 |
+| no session table | must be caught | 101 / 200 | 101 | 0 | 0 |
+| snapshots leave out the session table | must be caught | 27 / 200 | 9 | 23 | 0 |
+| leader never told whether a snapshot arrived | must be caught | 10 / 200 | 0 | 0 | 10 |
+| any node answers reads from its own state | must be caught | 161 / 200 | 161 | 0 | 0 |
+| leader answers reads from its own state | must be caught | 4 / 200 | 4 | 0 | 0 |
+| leader answers reads from its own state, no pauses | measured | 0 / 200 | 0 | 0 | 0 |
+| same, clients time out after 50 ms | must be caught | 2 / 200 | 2 | 0 | 0 |
+| lease reads (raft `ReadOnlyLeaseBased`), all faults | must be caught | 1 / 200 | 1 | 0 | 0 |
+| lease reads, no pauses | measured | 0 / 200 | 0 | 0 | 0 |
+| lease reads, no pauses, clocks drift up to 50% | measured | 0 / 200 | 0 | 0 | 0 |
+| lease reads, no pauses, clients time out after 50 ms | must be caught | 1 / 200 | 1 | 0 | 0 |
+
+"Safety check" is the simulator's own checks: the session-table-in-snapshot bug makes replicas diverge, which the end-of-run comparison catches more often (23) than Porcupine does (9). "Liveness" is a follower stuck forever because its leader was never told a snapshot was lost.
+
+**What the numbers taught me:**
+
+1. **Two leaders at once is common, not rare.** Cutting off the leader in 500 seeds: a new leader was elected before the old one stepped down in 260 (52%), overlapping by up to 89 ms (`TestTwoLeadersOverlap`). The reason is in raft's code: the leader checks for a quorum only once per election timeout and counts any reply since the previous check, so it can keep believing it leads for nearly two election timeouts after last hearing from a quorum. Followers can elect a new leader after one.
+2. **Random testing missed real bugs, and the reason was the workload.** Leader-local and lease reads were caught 0 times in 200 seeds without pauses, because clients waited 300 ms before trying another node, longer than the overlap. Nobody had found the new leader and written anything before the old one stepped down. With a 50 ms client timeout, both are caught.
+3. **So I wrote targeted tests for the mechanisms:**
+   - `TestNewLeaderReadingItsOwnStateIsStale`: the old leader commits and acknowledges `x=2`, then is cut off before telling anyone the new commit index. The new leader, reading its own state at once, returns `x=1`. ReadIndex returns `x=2`, because raft holds read-index requests until the new leader has committed an entry of its own term.
+   - `TestLeaseReadsGoStale`: with the old leader's clock at half speed, a lease read returns a stale value after the new leader acknowledged a newer one. **With every clock at the same speed, lease reads were still stale in 41 of 200 runs**, because of the check-once-per-timeout behaviour above. raft's documentation warns only about clock drift. ReadIndex was stale in 0 of 200. (I haven't checked whether this is discussed upstream.)
+
+**One failure, traced.** Leader-local reads, seed 380004 (`go run ./cmd/raftkv-sim -read leader-local -seed 380004`):
+
+```
+     1.877s  fault  partition [1] | [2 3]
+     2.001s  leader 2 leads term 2
+     3.487s  fault  pause 2
+     3.736s  fault  partition [2] | [1 3]
+     3.853s  leader 3 leads term 3
+     4.906s  fault  resume 2
+```
+
+Clients 0, 1 and 4 had sent reads to node 2 while it was paused. When it resumed at 4.906 s it still believed it led term 2 and answered all three from memory before reading anything from term 3. Client 0 got `k0 = "4.78;4.79;4.80;"`, a value replaced by an acknowledged write around 4.3 s; node 3 had been serving the newer value since then. Porcupine reports the history as not linearizable; the visualization shows which node answered each operation.
+
+Visualizations of failing runs, in `results/` (open in a browser; one row per client, rows for faults and leader changes, hover for the answering node):
+- `leader-local-read-seed-380004.html`: the run above
+- `lease-read-seed-410038.html`: lease reads, all faults
+
+## Run it
+
+```bash
+go test ./...                                        # everything, about a minute
+go test ./sim -run TestLinearizableUnderFaults -args -seeds 1000
+go run ./cmd/raftkv-sim -seeds 200                   # the correct system
+go run ./cmd/raftkv-sim -read leader-local -seeds 200 -from 380001
+go run ./cmd/raftkv-sim -read leader-local -seed 380004 -viz out.html
+go run ./cmd/raftkv-sim -bug no-sessions -seeds 50   # also: ack-before-commit, sessions-not-in-snapshot, no-snapshot-reports
+```

@@ -83,6 +83,12 @@ var Model = porcupine.Model{
 		}
 	},
 	DescribeState: func(s any) string { return fmt.Sprintf("%q", short(s.(string))) },
+	DescribeOperationMetadata: func(m any) string {
+		if m == nil {
+			return ""
+		}
+		return fmt.Sprintf("answered by node %v", m)
+	},
 }
 
 // Show the tail of long values: appends grow at the end.
@@ -109,5 +115,9 @@ func Visualize(info porcupine.LinearizationInfo, notes []porcupine.Annotation, p
 // Describe prints one operation for logs.
 func Describe(op porcupine.Operation) string {
 	d := Model.DescribeOperation(op.Input, op.Output)
-	return fmt.Sprintf("client %d [%v, %v] %s", op.ClientId, time.Duration(op.Call), time.Duration(op.Return), strings.TrimSpace(d))
+	by := ""
+	if op.Metadata != nil {
+		by = fmt.Sprintf(" (node %v)", op.Metadata)
+	}
+	return fmt.Sprintf("client %d [%v, %v] %s%s", op.ClientId, time.Duration(op.Call).Round(time.Microsecond), time.Duration(op.Return).Round(time.Microsecond), strings.TrimSpace(d), by)
 }

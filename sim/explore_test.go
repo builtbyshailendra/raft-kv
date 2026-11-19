@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ type summary struct {
 	messages, dropped                      int
 	snapSent, snapRestored                 int
 	failed                                 []uint64 // seeds that failed the checks
+	illegal, safety, liveness              int      // seeds failing each kind of check
 	firstFailure                           string
 	simTime, checkTime                     time.Duration
 }
@@ -72,10 +74,25 @@ func explore(t *testing.T, cfg RunConfig, from uint64, n int) summary {
 
 		var problems []string
 		problems = append(problems, r.Violations...)
+		live, safe := r.Unfinished > 0, false
+		for _, v := range r.Violations {
+			if strings.Contains(v, "did not reach") {
+				live = true
+			} else {
+				safe = true
+			}
+		}
+		if live {
+			s.liveness++
+		}
+		if safe {
+			s.safety++
+		}
 		if r.Unfinished > 0 {
 			problems = append(problems, fmt.Sprintf("%d operations never answered after healing", r.Unfinished))
 		}
 		if res != porcupine.Ok {
+			s.illegal++
 			problems = append(problems, fmt.Sprintf("linearizability: %s", res))
 			if *flagViz != "" {
 				path := filepath.Join(*flagViz, fmt.Sprintf("seed-%d.html", seed))

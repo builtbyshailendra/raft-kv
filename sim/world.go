@@ -37,6 +37,17 @@ type Config struct {
 	NetDelay  time.Duration // minimum one-way message delay, default 1ms
 	NetJitter time.Duration // extra random delay; it reorders messages. Default 10ms
 
+	// ClockDrift makes each node's clock run at its own speed, chosen per
+	// node from [1-d, 1+d] (0.5: between half and one and a half times as
+	// fast). Raft's timeouts are counted in ticks, so drift stretches them.
+	ClockDrift float64
+	// Speed sets a node's clock speed directly (overrides ClockDrift).
+	Speed map[uint64]float64
+
+	// NoSnapshotReports plants a transport bug: the leader is never told
+	// whether a snapshot arrived.
+	NoSnapshotReports bool
+
 	Node node.Options
 }
 
@@ -95,6 +106,7 @@ type server struct {
 	paused bool
 	inbox  []func(*node.Node)
 	starts uint64
+	speed  float64 // clock speed; 1 = normal
 }
 
 // Only one World may exist at a time: Raft draws its randomized election
@@ -153,7 +165,13 @@ func New(cfg Config) *World {
 		peers[i] = uint64(i + 1)
 	}
 	for _, id := range peers {
-		s := &server{id: id, disk: node.NewDisk(peers)}
+		s := &server{id: id, disk: node.NewDisk(peers), speed: 1}
+		if cfg.ClockDrift > 0 {
+			s.speed = 1 + cfg.ClockDrift*(2*w.rng.Float64()-1)
+		}
+		if v, ok := cfg.Speed[id]; ok {
+			s.speed = v
+		}
 		w.servers = append(w.servers, s)
 		w.start(s)
 	}
@@ -252,7 +270,7 @@ func (w *World) start(s *server) {
 // Each node ticks on its own schedule, starting at a random phase so the
 // nodes aren't in lockstep.
 func (w *World) startTicks(s *server, n *node.Node) {
-	period := w.cfg.Tick
+	period := time.Duration(float64(w.cfg.Tick) / s.speed)
 	var tick func()
 	tick = func() {
 		if s.n != n { // crashed or restarted since
@@ -330,6 +348,9 @@ func (w *World) sendRaft(from uint64, m *pb.Message) {
 // a real transport would once the stream finishes or fails. It goes only to
 // the same running instance that sent it.
 func (w *World) reportSnapshot(sender *node.Node, from, to uint64, ok bool) {
+	if w.cfg.NoSnapshotReports {
+		return
+	}
 	w.after(w.delay(), func() {
 		if s := w.server(from); s.n == sender && sender != nil {
 			w.deliver(s, func(n *node.Node) { n.ReportSnapshot(to, ok) })

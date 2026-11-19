@@ -3,3 +3,4 @@
 *.test
 *.out
 /testdata/fuzz/*/cache
+/results/viz/
