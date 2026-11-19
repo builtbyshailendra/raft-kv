@@ -68,6 +68,11 @@ type Stats struct {
 	Crashes    int
 	Restarts   int
 	Pauses     int
+
+	SnapshotsSent     int // MsgSnap messages (a leader sending its snapshot)
+	SnapshotsTaken    int
+	SnapshotsRestored int // followers replaced by a snapshot
+	MaxLog            int // longest log on any node, sampled every tick
 }
 
 // Call is a request sent with World.Request; it fills in when answered.
@@ -255,6 +260,9 @@ func (w *World) startTicks(s *server, n *node.Node) {
 		}
 		if !s.paused { // a paused process misses its ticks; it doesn't catch up
 			n.Tick()
+			if l := int(n.LogLen()); l > w.Stats.MaxLog {
+				w.Stats.MaxLog = l
+			}
 		}
 		w.after(period, tick)
 	}
@@ -275,8 +283,16 @@ func (w *World) sendRaft(from uint64, m *pb.Message) {
 	}
 	w.Stats.Messages++
 	w.Stats.Bytes += len(data)
+	snap := m.GetType() == pb.MsgSnap
+	sender := w.server(from).n
+	if snap {
+		w.Stats.SnapshotsSent++
+	}
 	if !w.connected(from, to) || w.lost() {
 		w.Stats.Dropped++
+		if snap {
+			w.reportSnapshot(sender, from, to, false)
+		}
 		return
 	}
 	copies := 1
@@ -286,11 +302,18 @@ func (w *World) sendRaft(from uint64, m *pb.Message) {
 	for range copies {
 		w.after(w.delay(), func() {
 			// A partition that starts while a message is in flight drops it too.
-			if !w.connected(from, to) {
+			dst := w.server(to)
+			if !w.connected(from, to) || dst.n == nil {
 				w.Stats.Dropped++
+				if snap {
+					w.reportSnapshot(sender, from, to, false)
+				}
 				return
 			}
-			w.deliver(w.server(to), func(n *node.Node) {
+			if snap {
+				w.reportSnapshot(sender, from, to, true)
+			}
+			w.deliver(dst, func(n *node.Node) {
 				msg := &pb.Message{}
 				if err := proto.Unmarshal(data, msg); err != nil {
 					panic(err)
@@ -301,6 +324,17 @@ func (w *World) sendRaft(from uint64, m *pb.Message) {
 			})
 		})
 	}
+}
+
+// reportSnapshot tells the sender whether its snapshot got through, the way
+// a real transport would once the stream finishes or fails. It goes only to
+// the same running instance that sent it.
+func (w *World) reportSnapshot(sender *node.Node, from, to uint64, ok bool) {
+	w.after(w.delay(), func() {
+		if s := w.server(from); s.n == sender && sender != nil {
+			w.deliver(s, func(n *node.Node) { n.ReportSnapshot(to, ok) })
+		}
+	})
 }
 
 // deliver hands something to a node: dropped if it's down, queued if it's
@@ -367,6 +401,10 @@ func (w *World) observe(e node.Event) {
 			w.violate("node %d applied a different entry at index %d", e.Node, e.Index)
 		}
 		w.applied[e.Index] = sum
+	case node.SnapshotTaken:
+		w.Stats.SnapshotsTaken++
+	case node.SnapshotRestored:
+		w.Stats.SnapshotsRestored++
 	}
 }
 

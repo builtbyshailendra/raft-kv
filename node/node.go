@@ -23,6 +23,13 @@ import (
 type Options struct {
 	ElectionTick  int // ticks without a leader before campaigning (randomized to [n, 2n))
 	HeartbeatTick int // ticks between leader heartbeats
+
+	// SnapshotEvery takes a snapshot after this many entries are applied
+	// since the last one, then drops the log before it except KeepEntries,
+	// which lets a follower that is slightly behind catch up from the log
+	// instead of needing a whole snapshot. 0 disables snapshots.
+	SnapshotEvery uint64
+	KeepEntries   uint64
 }
 
 func (o Options) withDefaults() Options {
@@ -53,8 +60,10 @@ const (
 type EventKind int
 
 const (
-	BecameLeader EventKind = iota + 1 // Term
-	Applied                           // Index, Term, Data (nil for an empty entry)
+	BecameLeader     EventKind = iota + 1 // Term
+	Applied                               // Index, Term, Data (nil for an empty entry)
+	SnapshotTaken                         // Index
+	SnapshotRestored                      // Index: state replaced by a snapshot from the leader
 )
 
 // Event is reported to Env.Observe so a harness can check invariants.
@@ -113,6 +122,8 @@ type Node struct {
 	ticks uint64
 	inc   uint64 // which start of this node this is; part of read IDs
 
+	snapIndex uint64 // index of the latest snapshot on disk
+
 	writes   map[writeKey]kv.Command // proposed here, waiting to be applied
 	reads    map[uint64]*pendingRead // asked Raft for a read index, no answer yet
 	waiting  []*pendingRead          // have a read index, waiting for apply to reach it
@@ -155,9 +166,10 @@ func Start(id, incarnation uint64, disk *raft.MemoryStorage, env Env, opts Optio
 	}
 	return &Node{
 		id: id, inc: incarnation, opts: opts, env: env, disk: disk, rn: rn, store: store,
-		conf:   snap.GetMetadata().GetConfState(),
-		writes: map[writeKey]kv.Command{},
-		reads:  map[uint64]*pendingRead{},
+		conf:      snap.GetMetadata().GetConfState(),
+		snapIndex: snap.GetMetadata().GetIndex(),
+		writes:    map[writeKey]kv.Command{},
+		reads:     map[uint64]*pendingRead{},
 	}, nil
 }
 
@@ -176,6 +188,31 @@ func (n *Node) Term() uint64 { return n.rn.BasicStatus().GetTerm() }
 
 // Applied is the index of the last entry applied to the state machine.
 func (n *Node) Applied() uint64 { return n.store.Applied() }
+
+// LogLen is the number of entries on disk (after compaction).
+func (n *Node) LogLen() uint64 {
+	first, _ := n.disk.FirstIndex()
+	last, _ := n.disk.LastIndex()
+	if last < first {
+		return 0
+	}
+	return last - first + 1
+}
+
+// SnapshotIndex is the index of the latest snapshot on disk.
+func (n *Node) SnapshotIndex() uint64 { return n.snapIndex }
+
+// ReportSnapshot tells Raft whether a snapshot this node sent arrived. Raft
+// stops sending to a follower while its snapshot is in flight, so a lost
+// snapshot must be reported or that follower is stuck.
+func (n *Node) ReportSnapshot(to uint64, ok bool) {
+	status := raft.SnapshotFinish
+	if !ok {
+		status = raft.SnapshotFailure
+	}
+	n.rn.ReportSnapshot(to, status)
+	n.process()
+}
 
 // Hash summarizes the state machine for comparing replicas.
 func (n *Node) Hash() uint64 { return n.store.Hash() }
@@ -305,7 +342,16 @@ func (n *Node) process() {
 		for _, m := range rd.Messages {
 			n.env.Send(m)
 		}
-		// 3. Apply committed entries to the state machine.
+		// 3. Apply: first a snapshot from the leader (it replaces the state
+		// machine), then committed entries.
+		if !raft.IsEmptySnap(rd.Snapshot) {
+			i := rd.Snapshot.GetMetadata().GetIndex()
+			if err := n.store.Restore(rd.Snapshot.GetData(), i); err != nil {
+				panic(fmt.Sprintf("node %d: %v", n.id, err))
+			}
+			n.conf, n.snapIndex = rd.Snapshot.GetMetadata().GetConfState(), i
+			n.env.Observe(Event{Kind: SnapshotRestored, Node: n.id, Index: i})
+		}
 		for _, e := range rd.CommittedEntries {
 			n.apply(e)
 		}
@@ -321,7 +367,30 @@ func (n *Node) process() {
 		}
 		n.serveReads()
 		n.rn.Advance(rd)
+		n.maybeSnapshot()
 	}
+}
+
+// maybeSnapshot saves the state machine at the applied index and compacts
+// the log behind it.
+func (n *Node) maybeSnapshot() {
+	every := n.opts.SnapshotEvery
+	applied := n.store.Applied()
+	if every == 0 || applied-n.snapIndex < every {
+		return
+	}
+	data := n.store.Snapshot(true)
+	if _, err := n.disk.CreateSnapshot(applied, n.conf, data); err != nil {
+		panic(fmt.Sprintf("node %d: snapshot at %d: %v", n.id, applied, err))
+	}
+	n.snapIndex = applied
+	if applied > n.opts.KeepEntries {
+		compact := applied - n.opts.KeepEntries
+		if first, _ := n.disk.FirstIndex(); compact >= first {
+			must(n.disk.Compact(compact))
+		}
+	}
+	n.env.Observe(Event{Kind: SnapshotTaken, Node: n.id, Index: applied})
 }
 
 func (n *Node) softState(ss raft.SoftState) {

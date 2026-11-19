@@ -50,16 +50,20 @@ func waitDone(t *testing.T, w *World, calls ...*Call) {
 // compares state machines.
 func converged(t *testing.T, w *World) {
 	t.Helper()
-	same := func() bool {
-		var idx uint64
+	// Don't use 0 as "not set": a node that just restarted is at index 0.
+	running := func() []uint64 {
+		var ids []uint64
 		for _, id := range w.IDs() {
-			n := w.Node(id)
-			if n == nil {
-				continue
+			if w.Node(id) != nil {
+				ids = append(ids, id)
 			}
-			if idx == 0 {
-				idx = n.Applied()
-			} else if n.Applied() != idx {
+		}
+		return ids
+	}
+	same := func() bool {
+		ids := running()
+		for _, id := range ids[1:] {
+			if w.Node(id).Applied() != w.Node(ids[0]).Applied() {
 				return false
 			}
 		}
@@ -68,14 +72,10 @@ func converged(t *testing.T, w *World) {
 	if !w.RunUntil(same, 5*time.Second) {
 		t.Fatalf("replicas did not reach the same applied index")
 	}
-	var h uint64
-	for _, id := range w.IDs() {
-		if n := w.Node(id); n != nil {
-			if h == 0 {
-				h = n.Hash()
-			} else if n.Hash() != h {
-				t.Fatalf("node %d state differs at applied index %d", id, n.Applied())
-			}
+	ids := running()
+	for _, id := range ids[1:] {
+		if w.Node(id).Hash() != w.Node(ids[0]).Hash() {
+			t.Fatalf("node %d state differs from node %d at applied index %d", id, ids[0], w.Node(id).Applied())
 		}
 	}
 }

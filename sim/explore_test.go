@@ -24,6 +24,7 @@ type summary struct {
 	runs, ops, gets, unfinished            int
 	partitions, crashes, pauses, elections int
 	messages, dropped                      int
+	snapSent, snapRestored                 int
 	failed                                 []uint64 // seeds that failed the checks
 	firstFailure                           string
 	simTime, checkTime                     time.Duration
@@ -66,6 +67,8 @@ func explore(t *testing.T, cfg RunConfig, from uint64, n int) summary {
 		s.elections += r.Stats.Elections
 		s.messages += r.Stats.Messages
 		s.dropped += r.Stats.Dropped
+		s.snapSent += r.Stats.SnapshotsSent
+		s.snapRestored += r.Stats.SnapshotsRestored
 
 		var problems []string
 		problems = append(problems, r.Violations...)
@@ -96,6 +99,9 @@ func (s summary) log(t *testing.T) {
 	t.Helper()
 	t.Logf("%d runs: %d operations checked (%d reads), %d partitions, %d crashes, %d pauses, %d elections, %d Raft messages (%d dropped)",
 		s.runs, s.ops, s.gets, s.partitions, s.crashes, s.pauses, s.elections, s.messages, s.dropped)
+	if s.snapSent > 0 {
+		t.Logf("snapshots: %d sent by leaders, %d installed by followers", s.snapSent, s.snapRestored)
+	}
 	t.Logf("simulation %v (%v per run), Porcupine %v; failing seeds: %d %v",
 		s.simTime.Round(time.Millisecond), (s.simTime / time.Duration(max(s.runs, 1))).Round(time.Millisecond),
 		s.checkTime.Round(time.Millisecond), len(s.failed), s.failed)

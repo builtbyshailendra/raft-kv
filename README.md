@@ -60,3 +60,18 @@ Results (`go test ./sim -run TestLinearizableUnderFaults -args -seeds 1000`):
 | Failing seeds | 0 | 0 |
 
 That's 470,326 operations, all linearizable, in about 19 seconds. A passing checker means nothing until it is shown to fail on bugs: that's step 5.
+
+### Step 4: snapshots and log compaction
+
+- After `SnapshotEvery` applied entries a node saves its state machine (data **and** session table) with `CreateSnapshot` and compacts the log except the last `KeepEntries`, which lets a follower slightly behind catch up from the log.
+- A follower too far behind gets the leader's snapshot (`MsgSnap`); it replaces its state machine and continues from the snapshot index.
+- The simulated transport reports each snapshot's fate back to the leader (`ReportSnapshot`): raft stops sending to a follower while a snapshot is in flight, so a lost snapshot that's never reported leaves that follower stuck.
+- A restart now recovers from the last snapshot on disk plus the log after it.
+
+Tests:
+- A node down while 300 writes happen comes back to a leader whose log starts at 290. It catches up through a snapshot and ends identical to the others.
+- 1,000 writes: the longest log is 1,001 entries without snapshots and 120 with them (every 100, keep 20).
+- The session table survives a snapshot and a whole-cluster restart: a very late retry of append #100 (applied long before the snapshot) is recognized and not applied again.
+- 500 seeds with every fault on and aggressive snapshots (every 20 entries, keep 5): 188,419 operations, all linearizable. Leaders sent 749 snapshots and followers installed 715; the other 34 were lost in transit, reported as failed, and resent.
+
+**What broke:** the first snapshot test failed with "node 2 state differs". The bug was in my test helper, not the store: it used 0 to mean "no applied index seen yet", so a node that had just restarted (applied index 0) was skipped and the helper declared convergence too early. Fixed to compare all running nodes; every earlier test that uses it was rerun and still passes.
