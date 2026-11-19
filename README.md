@@ -4,6 +4,27 @@ A replicated key-value store on etcd's Raft library, tested inside a determinist
 
 Built pairing with Claude Code, as a learning project. Nothing here has run outside this laptop.
 
+**What it shows:**
+- 1,250 seeded runs with partitions, crashes, process pauses, message loss and duplication: 470,326 client operations, all **linearizable** by Porcupine, with Raft's safety properties checked on every event.
+- The checks have teeth: every planted bug (acknowledging writes early, no session table, sessions missing from snapshots, local reads, lease reads, unreported snapshots) is caught, and the correct system never fails. Two of the bugs were caught only after clients were made to retry faster, or by a targeted test (step 5).
+- A measured finding: when the leader is cut off, a new leader is elected before the old one steps down in 52% of runs, and etcd raft's lease reads go stale in 41 of 200 targeted runs **even with equal clock speeds**.
+
+Learning notes and explain-it questions: [LEARN.md](LEARN.md). Interview brief: [`../briefs/raft-kv.md`](../briefs/raft-kv.md).
+
+```text
+clients (5, outside the cluster)        nemesis: partition / crash / pause / loss
+   │ put, append, get (retry, same seq)       │
+   ▼                                          ▼
+ ┌──────────── sim: one goroutine, virtual clock, one seeded RNG ────────────┐
+ │  node 1            node 2            node 3     protobuf-encoded messages,│
+ │  RawNode           RawNode           RawNode    1–11 ms delay, reordered  │
+ │  MemoryStorage ◄── the "disk": survives crash                             │
+ │  kv.Store (data + sessions) ◄── memory: lost on crash                     │
+ └───────────────────────────────────────────────────────────────────────────┘
+   history of (call, return, input, output) ──► Porcupine: linearizable?
+   every event ──► one leader per term? same entry at every index?
+```
+
 ## Build log
 
 ### Step 1: one node, the Ready loop, a simulator
@@ -137,3 +158,12 @@ go run ./cmd/raftkv-sim -read leader-local -seeds 200 -from 380001
 go run ./cmd/raftkv-sim -read leader-local -seed 380004 -viz out.html
 go run ./cmd/raftkv-sim -bug no-sessions -seeds 50   # also: ack-before-commit, sessions-not-in-snapshot, no-snapshot-reports
 ```
+
+## What it doesn't do
+
+- **It never leaves the simulator.** No real network, disk or processes; `MemoryStorage` stands in for an fsync'd write-ahead log. A real deployment needs a WAL (etcd's `wal` package), a transport (gRPC or HTTP) and real timers.
+- **Membership never changes.** No adding or removing nodes; the conf-change code path is there but unused.
+- **The disk never lies.** A crash loses memory, never acknowledged writes; there's no torn write, lost fsync or corrupted entry.
+- **Clients sit outside the partitions.** Every client can reach every node unless messages are lost.
+- **Passing seeds are evidence, not proof.** The random runs missed two real bugs until the client timeout was shortened, so the targeted tests matter as much as the seed count.
+- No CI, not published.
