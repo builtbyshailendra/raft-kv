@@ -62,6 +62,11 @@ type Stats struct {
 	Dropped   int
 	Bytes     int // encoded size of Raft messages sent
 	Elections int // times a node became leader
+
+	Partitions int
+	Crashes    int
+	Restarts   int
+	Pauses     int
 }
 
 // Call is a request sent with World.Request; it fills in when answered.
@@ -77,6 +82,12 @@ type server struct {
 	id   uint64
 	disk *raft.MemoryStorage // survives a crash
 	n    *node.Node          // nil while crashed
+	// Nodes talk only to nodes in the same group. All 0 = no partition.
+	group int
+	// A paused node (a long GC pause, a stalled VM) neither ticks nor
+	// handles anything; what arrives meanwhile waits in its inbox.
+	paused bool
+	inbox  []func(*node.Node)
 }
 
 // Only one World may exist at a time: Raft draws its randomized election
@@ -98,6 +109,9 @@ type World struct {
 	servers []*server
 	calls   map[callKey]*Call
 	trace   hash.Hash64
+	loss    float64 // probability that any message is lost
+	dup     float64 // probability that a Raft message is delivered twice
+	notes   []Note  // faults, for the timeline
 
 	Stats Stats
 
@@ -231,7 +245,9 @@ func (w *World) startTicks(s *server, n *node.Node) {
 		if s.n != n { // crashed or restarted since
 			return
 		}
-		n.Tick()
+		if !s.paused { // a paused process misses its ticks; it doesn't catch up
+			n.Tick()
+		}
 		w.after(period, tick)
 	}
 	w.after(1+time.Duration(w.rng.Int64N(int64(period))), tick)
@@ -251,35 +267,70 @@ func (w *World) sendRaft(from uint64, m *pb.Message) {
 	}
 	w.Stats.Messages++
 	w.Stats.Bytes += len(data)
-	w.after(w.delay(), func() {
-		dst := w.server(to)
-		if dst.n == nil {
-			w.Stats.Dropped++
-			return
-		}
-		msg := &pb.Message{}
-		if err := proto.Unmarshal(data, msg); err != nil {
-			panic(err)
-		}
-		w.Stats.Delivered++
-		w.mix(uint64(w.now), from, to, uint64(msg.GetType()), msg.GetTerm(), msg.GetIndex())
-		dst.n.Step(msg)
-	})
+	if !w.connected(from, to) || w.lost() {
+		w.Stats.Dropped++
+		return
+	}
+	copies := 1
+	if w.dup > 0 && w.rng.Float64() < w.dup {
+		copies = 2
+	}
+	for range copies {
+		w.after(w.delay(), func() {
+			// A partition that starts while a message is in flight drops it too.
+			if !w.connected(from, to) {
+				w.Stats.Dropped++
+				return
+			}
+			w.deliver(w.server(to), func(n *node.Node) {
+				msg := &pb.Message{}
+				if err := proto.Unmarshal(data, msg); err != nil {
+					panic(err)
+				}
+				w.Stats.Delivered++
+				w.mix(uint64(w.now), from, to, uint64(msg.GetType()), msg.GetTerm(), msg.GetIndex())
+				n.Step(msg)
+			})
+		})
+	}
 }
+
+// deliver hands something to a node: dropped if it's down, queued if it's
+// paused.
+func (w *World) deliver(s *server, fn func(*node.Node)) {
+	switch {
+	case s.n == nil:
+		w.Stats.Dropped++
+	case s.paused:
+		s.inbox = append(s.inbox, fn)
+	default:
+		fn(s.n)
+	}
+}
+
+func (w *World) connected(a, b uint64) bool { return w.server(a).group == w.server(b).group }
+
+func (w *World) lost() bool { return w.loss > 0 && w.rng.Float64() < w.loss }
 
 // Request sends a client command straight to one node.
 func (w *World) Request(to uint64, c kv.Command) *Call {
 	call := &Call{}
 	w.calls[callKey{c.Client, c.Seq}] = call
+	if w.lost() {
+		return call
+	}
 	w.after(w.delay(), func() {
-		if n := w.server(to).n; n != nil {
-			n.Handle(c)
-		}
+		w.deliver(w.server(to), func(n *node.Node) { n.Handle(c) })
 	})
 	return call
 }
 
+// Clients sit outside the cluster: partitions between nodes don't cut them
+// off, but message loss does.
 func (w *World) reply(from uint64, r node.Response) {
+	if w.lost() {
+		return
+	}
 	w.after(w.delay(), func() {
 		w.mix(uint64(w.now), from, r.Client, r.Seq, boolInt(r.OK))
 		if call, ok := w.calls[callKey{r.Client, r.Seq}]; ok && !call.Done {
