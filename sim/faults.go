@@ -9,14 +9,15 @@ import (
 // Note is a fault or recovery action, kept for the run's timeline.
 type Note struct {
 	At   time.Duration
+	Tag  string // "fault" or "leader"
 	Text string
 }
 
 // Notes lists the fault actions so far.
 func (w *World) Notes() []Note { return w.notes }
 
-func (w *World) note(format string, args ...any) {
-	w.notes = append(w.notes, Note{At: w.now, Text: fmt.Sprintf(format, args...)})
+func (w *World) note(tag, format string, args ...any) {
+	w.notes = append(w.notes, Note{At: w.now, Tag: tag, Text: fmt.Sprintf(format, args...)})
 }
 
 // Partition splits the nodes into groups that can't reach each other. Nodes
@@ -33,7 +34,7 @@ func (w *World) Partition(groups ...[]uint64) {
 		parts = append(parts, fmt.Sprint(g))
 	}
 	w.Stats.Partitions++
-	w.note("partition %s", strings.Join(parts, " | "))
+	w.note("fault", "partition %s", strings.Join(parts, " | "))
 }
 
 // Heal removes every partition.
@@ -41,13 +42,13 @@ func (w *World) Heal() {
 	for _, s := range w.servers {
 		s.group = 0
 	}
-	w.note("heal")
+	w.note("fault", "heal")
 }
 
 // SetLoss sets the probability that any message (Raft or client) is lost.
 func (w *World) SetLoss(p float64) {
 	w.loss = p
-	w.note("message loss %.0f%%", p*100)
+	w.note("fault", "message loss %.0f%%", p*100)
 }
 
 // SetDup sets the probability that a Raft message is delivered twice.
@@ -62,7 +63,7 @@ func (w *World) Crash(id uint64) {
 	}
 	s.n, s.paused, s.inbox = nil, false, nil
 	w.Stats.Crashes++
-	w.note("crash %d", id)
+	w.note("fault", "crash %d", id)
 }
 
 // Restart starts a crashed node from its disk.
@@ -73,7 +74,7 @@ func (w *World) Restart(id uint64) {
 	}
 	w.start(s)
 	w.Stats.Restarts++
-	w.note("restart %d", id)
+	w.note("fault", "restart %d", id)
 }
 
 // Down lists the crashed nodes.
@@ -96,7 +97,7 @@ func (w *World) Pause(id uint64) {
 	}
 	s.paused = true
 	w.Stats.Pauses++
-	w.note("pause %d", id)
+	w.note("fault", "pause %d", id)
 }
 
 // Resume unfreezes a node. It first works through everything that arrived
@@ -107,7 +108,7 @@ func (w *World) Resume(id uint64) {
 		return
 	}
 	s.paused = false
-	w.note("resume %d", id)
+	w.note("fault", "resume %d", id)
 	inbox := s.inbox
 	s.inbox = nil
 	for _, fn := range inbox {

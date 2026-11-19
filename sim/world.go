@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anishathalye/porcupine"
 	"go.etcd.io/raft/v3"
 	pb "go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -88,6 +89,7 @@ type server struct {
 	// handles anything; what arrives meanwhile waits in its inbox.
 	paused bool
 	inbox  []func(*node.Node)
+	starts uint64
 }
 
 // Only one World may exist at a time: Raft draws its randomized election
@@ -112,6 +114,11 @@ type World struct {
 	loss    float64 // probability that any message is lost
 	dup     float64 // probability that a Raft message is delivered twice
 	notes   []Note  // faults, for the timeline
+
+	clients  map[uint64]*client
+	ops      []porcupine.Operation
+	faults   Faults
+	faultsOn bool
 
 	Stats Stats
 
@@ -228,7 +235,8 @@ func (w *World) after(d time.Duration, fn func()) {
 func (w *World) server(id uint64) *server { return w.servers[id-1] }
 
 func (w *World) start(s *server) {
-	n, err := node.Start(s.id, s.disk, &env{w: w, from: s.id}, w.cfg.Node)
+	s.starts++
+	n, err := node.Start(s.id, s.starts, s.disk, &env{w: w, from: s.id}, w.cfg.Node)
 	if err != nil {
 		panic(err)
 	}
@@ -316,12 +324,7 @@ func (w *World) lost() bool { return w.loss > 0 && w.rng.Float64() < w.loss }
 func (w *World) Request(to uint64, c kv.Command) *Call {
 	call := &Call{}
 	w.calls[callKey{c.Client, c.Seq}] = call
-	if w.lost() {
-		return call
-	}
-	w.after(w.delay(), func() {
-		w.deliver(w.server(to), func(n *node.Node) { n.Handle(c) })
-	})
+	w.toNode(to, c)
 	return call
 }
 
@@ -333,8 +336,12 @@ func (w *World) reply(from uint64, r node.Response) {
 	}
 	w.after(w.delay(), func() {
 		w.mix(uint64(w.now), from, r.Client, r.Seq, boolInt(r.OK))
-		if call, ok := w.calls[callKey{r.Client, r.Seq}]; ok && !call.Done {
-			call.Done, call.Resp, call.At = true, r, w.now
+		if call, ok := w.calls[callKey{r.Client, r.Seq}]; ok {
+			if !call.Done {
+				call.Done, call.Resp, call.At = true, r, w.now
+			}
+		} else if c := w.clients[r.Client]; c != nil {
+			c.onReply(from, r)
 		}
 	})
 }
@@ -349,6 +356,7 @@ func (w *World) observe(e node.Event) {
 			w.violate("two leaders in term %d: nodes %d and %d", e.Term, prev, e.Node)
 		}
 		w.leaders[e.Term] = e.Node
+		w.note("leader", "%d leads term %d", e.Node, e.Term)
 	case node.Applied:
 		// State Machine Safety: every node applies the same entry at an index.
 		h := fnv.New64a()

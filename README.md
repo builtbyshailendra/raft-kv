@@ -36,3 +36,27 @@ Tests:
 - **A paused leader wakes up believing it leads.** During a 2-second pause the others elect a new leader and commit `x=new`; the paused node still thinks it leads and still has `x=old`. Only processing the new term's heartbeats from its inbox corrects it.
 
 What I learned here: with CheckQuorum on and equal clocks, the isolated leader stepped down (93 ms after the cut) before the majority elected a new one (111 ms). So a leader answering reads from its own memory would rarely be caught by partitions alone. A pause is what opens the window: the paused node doesn't tick, so it can't notice anything. That's why the pause fault exists.
+
+### Step 3: clients, linearizable reads, Porcupine
+
+- **Clients** know only node IDs. Each runs one operation at a time: it sends to its guess of the leader, follows "not leader" hints, moves to the next node after a 300 ms timeout, and retries with the same sequence number. 5 clients on 3 keys, half reads, half writes (put or append, every value unique).
+- **Reads use ReadIndex** (raft's `ReadOnlySafe`). Any node can serve one: a follower asks the leader for the commit index; the leader confirms it's still leader with a heartbeat round to a quorum; the read is answered once the node has applied up to that index. 30% of reads go to a random node to exercise follower reads.
+- **The fault scheduler** picks a random action every 200 ms–1 s: partition (cutting off the leader half the time), heal, crash, restart, pause for 0.3–1.8 s, or set message loss to 0/10/20%. It never impairs more than a minority at once. After 5 s it heals everything and the run must finish.
+- **Every run is checked three ways:** the simulator's safety checks (one leader per term; the same entry at every index; replicas identical at the end); liveness (every operation answered after healing); and **Porcupine** on the client history: is there one order of all operations, consistent with real time, that a single-copy key-value store could have produced? The model is partitioned by key, so each key is checked on its own.
+- An operation that never got an answer is kept in the history as a write that may have happened at any time after it was sent, so a read that saw it isn't flagged by mistake.
+
+Porcupine was first tested on hand-written histories: it rejects a stale read, a value that flips back, an append applied twice and a lost acknowledged write, and accepts a read overlapping a write that sees either value.
+
+Results (`go test ./sim -run TestLinearizableUnderFaults -args -seeds 1000`):
+
+| | 3 nodes | 5 nodes |
+|---|---|---|
+| Seeds | 1,000 | 250 |
+| Operations checked | 376,701 (188,386 reads) | 93,625 (46,699 reads) |
+| Partitions / crashes / pauses | 1,235 / 791 / 762 | 320 / 313 / 281 |
+| Elections | 2,766 | 785 |
+| Raft messages (dropped) | 4.88 M (451 k) | 2.55 M (198 k) |
+| Time: simulation, Porcupine | 11.9 s (12 ms a run), 0.5 s | 5.5 s (22 ms a run), 0.1 s |
+| Failing seeds | 0 | 0 |
+
+That's 470,326 operations, all linearizable, in about 19 seconds. A passing checker means nothing until it is shown to fail on bugs: that's step 5.

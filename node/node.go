@@ -8,6 +8,7 @@
 package node
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sort"
 
@@ -91,6 +92,12 @@ func NewDisk(peers []uint64) *raft.MemoryStorage {
 
 type writeKey struct{ client, seq uint64 }
 
+type pendingRead struct {
+	cmd   kv.Command
+	tick  uint64 // when the read was asked for
+	index uint64 // the read index, once Raft has confirmed it
+}
+
 // Node is one running replica. All methods must be called from one goroutine.
 type Node struct {
 	id    uint64
@@ -103,14 +110,20 @@ type Node struct {
 
 	lead  uint64
 	state raft.StateType
+	ticks uint64
+	inc   uint64 // which start of this node this is; part of read IDs
 
-	writes map[writeKey]kv.Command // proposed here, waiting to be applied
+	writes   map[writeKey]kv.Command // proposed here, waiting to be applied
+	reads    map[uint64]*pendingRead // asked Raft for a read index, no answer yet
+	waiting  []*pendingRead          // have a read index, waiting for apply to reach it
+	nextRead uint64
 }
 
 // Start creates a node over disk, recovering from whatever is on it: the
 // state machine is restored from the latest snapshot and Raft replays the
-// committed entries after it.
-func Start(id uint64, disk *raft.MemoryStorage, env Env, opts Options) (*Node, error) {
+// committed entries after it. incarnation must differ on every start of the
+// same node (it keeps read request IDs unique across restarts).
+func Start(id, incarnation uint64, disk *raft.MemoryStorage, env Env, opts Options) (*Node, error) {
 	opts = opts.withDefaults()
 	snap, err := disk.Snapshot()
 	if err != nil {
@@ -141,9 +154,10 @@ func Start(id uint64, disk *raft.MemoryStorage, env Env, opts Options) (*Node, e
 		return nil, err
 	}
 	return &Node{
-		id: id, opts: opts, env: env, disk: disk, rn: rn, store: store,
+		id: id, inc: incarnation, opts: opts, env: env, disk: disk, rn: rn, store: store,
 		conf:   snap.GetMetadata().GetConfState(),
 		writes: map[writeKey]kv.Command{},
+		reads:  map[uint64]*pendingRead{},
 	}, nil
 }
 
@@ -171,7 +185,9 @@ func (n *Node) Read(key string) string { return n.store.Get(key) }
 
 // Tick advances the node's logical clock by one tick.
 func (n *Node) Tick() {
+	n.ticks++
 	n.rn.Tick()
+	n.expireReads()
 	n.process()
 }
 
@@ -192,7 +208,7 @@ func (n *Node) Campaign() {
 // Handle serves a client request. The answer arrives later through Env.Reply.
 func (n *Node) Handle(c kv.Command) {
 	if c.Kind == kv.Get {
-		n.reply(c, Response{Err: "reads not supported yet"})
+		n.read(c)
 		return
 	}
 	if n.state != raft.StateLeader {
@@ -207,6 +223,62 @@ func (n *Node) Handle(c kv.Command) {
 	// would acknowledge a write that a new leader may later overwrite.
 	n.writes[writeKey{c.Client, c.Seq}] = c
 	n.process()
+}
+
+// read serves a Get with ReadIndex. Any node can do it: a follower asks the
+// leader for the current commit index; the leader confirms it is still
+// leader with a round of heartbeats to a quorum (raft's ReadOnlySafe) before
+// answering. The read is then served once this node has applied up to that
+// index, so it reflects every write acknowledged before the read began.
+func (n *Node) read(c kv.Command) {
+	if n.lead == raft.None {
+		n.reply(c, Response{Err: ErrNotLeader})
+		return
+	}
+	n.nextRead++
+	ctx := make([]byte, 24)
+	binary.BigEndian.PutUint64(ctx, n.id)
+	binary.BigEndian.PutUint64(ctx[8:], n.inc)
+	binary.BigEndian.PutUint64(ctx[16:], n.nextRead)
+	n.reads[n.nextRead] = &pendingRead{cmd: c, tick: n.ticks}
+	n.rn.ReadIndex(ctx)
+	n.process()
+}
+
+func (n *Node) readID(ctx []byte) (uint64, bool) {
+	if len(ctx) != 24 || binary.BigEndian.Uint64(ctx) != n.id || binary.BigEndian.Uint64(ctx[8:]) != n.inc {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(ctx[16:]), true
+}
+
+// A read index request can vanish (sent to a leader that just lost its
+// role). Give up on it after a few election timeouts; the client retries.
+func (n *Node) expireReads() {
+	limit := uint64(3 * n.opts.ElectionTick)
+	var ids []uint64
+	for id, r := range n.reads {
+		if n.ticks-r.tick > limit {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		n.reply(n.reads[id].cmd, Response{Err: ErrRetry})
+		delete(n.reads, id)
+	}
+}
+
+func (n *Node) serveReads() {
+	kept := n.waiting[:0]
+	for _, r := range n.waiting {
+		if r.index <= n.store.Applied() {
+			n.reply(r.cmd, Response{OK: true, Value: n.store.Get(r.cmd.Key)})
+		} else {
+			kept = append(kept, r)
+		}
+	}
+	n.waiting = kept
 }
 
 func (n *Node) reply(c kv.Command, r Response) {
@@ -237,12 +309,24 @@ func (n *Node) process() {
 		for _, e := range rd.CommittedEntries {
 			n.apply(e)
 		}
+		// 4. Reads whose index Raft confirmed can be served once applied.
+		for _, rs := range rd.ReadStates {
+			if id, ok := n.readID(rs.RequestCtx); ok {
+				if r, ok := n.reads[id]; ok {
+					delete(n.reads, id)
+					r.index = rs.Index
+					n.waiting = append(n.waiting, r)
+				}
+			}
+		}
+		n.serveReads()
 		n.rn.Advance(rd)
 	}
 }
 
 func (n *Node) softState(ss raft.SoftState) {
 	wasLeader := n.state == raft.StateLeader
+	leadChanged := ss.Lead != n.lead
 	n.lead, n.state = ss.Lead, ss.RaftState
 	if n.state == raft.StateLeader && !wasLeader {
 		n.env.Observe(Event{Kind: BecameLeader, Node: n.id, Term: n.Term()})
@@ -251,11 +335,28 @@ func (n *Node) softState(ss raft.SoftState) {
 		// Proposals still in flight may or may not commit. Tell the clients
 		// to retry; the session table makes a retry of a write that did
 		// commit harmless.
-		n.failPending()
+		n.failWrites()
+	}
+	if leadChanged {
+		// Unconfirmed read index requests went to a leader that is gone.
+		// Reads that already have an index stay valid and keep waiting.
+		n.failReads()
 	}
 }
 
-func (n *Node) failPending() {
+func (n *Node) failReads() {
+	ids := make([]uint64, 0, len(n.reads))
+	for id := range n.reads {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		n.reply(n.reads[id].cmd, Response{Err: ErrRetry})
+		delete(n.reads, id)
+	}
+}
+
+func (n *Node) failWrites() {
 	keys := make([]writeKey, 0, len(n.writes))
 	for k := range n.writes {
 		keys = append(keys, k)
