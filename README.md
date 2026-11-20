@@ -1,5 +1,7 @@
 # raft-kv
 
+[![ci](https://github.com/builtbyshailendra/raft-kv/actions/workflows/ci.yml/badge.svg)](https://github.com/builtbyshailendra/raft-kv/actions/workflows/ci.yml)
+
 A replicated key-value store on etcd's Raft library, tested inside a deterministic simulator: one goroutine, a virtual clock, one seeded random generator. The same seed replays the same run event for event.
 
 Built pairing with Claude Code, as a learning project. Nothing here has run outside this laptop.
@@ -166,4 +168,4 @@ go run ./cmd/raftkv-sim -bug no-sessions -seeds 50   # also: ack-before-commit, 
 - **The disk never lies.** A crash loses memory, never acknowledged writes; there's no torn write, lost fsync or corrupted entry.
 - **Clients sit outside the partitions.** Every client can reach every node unless messages are lost.
 - **Passing seeds are evidence, not proof.** The random runs missed two real bugs until the client timeout was shortened, so the targeted tests matter as much as the seed count.
-- No CI, not published.
+- CI (badge above) was added when the project was published, 20 Nov 2026, after the build.
